@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rocket-mcp-proxy"
+version = "1.0.0"
+description = "STDIO proxy for HTTP-based MCP servers"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+]
+
+[project.scripts]
+rocket_mcp_proxy = "rocket_mcp_proxy:main"
+
+[tool.setuptools]
+py-modules = ["rocket_mcp_proxy"]
+

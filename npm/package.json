@@ -1,0 +1,21 @@
+{
+  "name": "@aicoe/rocket-mcp-proxy",
+  "version": "1.0.7",
+  "description": "STDIO proxy for HTTP-based MCP servers — downloads platform binary on first run",
+  "bin": {
+    "rocket_mcp_proxy": "bin/launcher.js"
+  },
+  "scripts": {
+    "postinstall": "node bin/setup.js",
+    "setup": "node bin/setup.js"
+  },
+  "files": [
+    "bin/",
+    "resources/"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "UNLICENSED",
+  "private": false
+}

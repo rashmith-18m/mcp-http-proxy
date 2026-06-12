@@ -1,0 +1,69 @@
+{
+  "defaultServer": "mcp-server-1",
+  "servers": {
+    "mcp-server-1": {
+      "url": "http://localhost:8081/mcp",
+      "type": "http"
+    },
+    "mcp-server-2": {
+      "url": "http://localhost:8082/mcp",
+      "type": "http",
+      "headers": {
+        "Authorization": "Bearer your-token-here",
+        "X-Custom-Header": "custom-value"
+      }
+    },
+    "mcp-server-3": {
+      "url": "http://localhost:8083/sse",
+      "type": "sse"
+    },
+    "mcp-server-4": {
+      "url": "https://your-server.rocketsoftware.com/mcp",
+      "type": "http",
+      "auth": "oauth"
+    },
+    "mcp-server-5": {
+      "url": "https://your-server.rocketsoftware.com/mcp",
+      "type": "http",
+      "auth": {
+        "type": "oauth",
+        "clientId": "your-client-id",
+        "clientSecret": "your-client-secret",
+        "scopes": "openid profile",
+        "callbackPort": 8085
+      }
+    },
+    "mcp-server-6": {
+      "url": "https://your-server.rocketsoftware.com/mcp",
+      "type": "http",
+      "auth": {
+        "type": "oauth",
+        "clientId": "your-client-id"
+      }
+    },
+    "mcp-server-7": {
+      "url": "https://your-server.rocketsoftware.com/mcp",
+      "type": "http",
+      "auth": "oauth"
+    },
+    "mcp-server-8": {
+      "url": "https://your-server.rocketsoftware.com/mcp",
+      "type": "http",
+      "auth": {
+        "type": "oauth",
+        "clientId": "your-client-id",
+        "clientSecret": "your-client-secret",
+        "scopes": "openid profile",
+        "callbackPort": 8085
+      }
+    },
+    "mcp-server-9": {
+      "url": "https://your-server.rocketsoftware.com/mcp",
+      "type": "http",
+      "auth": {
+        "type": "oauth",
+        "clientId": "your-client-id"
+      }
+    }
+  }
+}
