@@ -743,66 +743,53 @@ def main():
                 pass
         logger.info("Reconnected — IDE notified to refresh tools/resources/prompts")
 
-    def _is_client_dead(upstream_client) -> bool:
-        """Check if a cached upstream client's session has died."""
-        state = upstream_client._session_state
-        # Session task exists but has finished → session crashed
-        if state.session_task is not None and state.session_task.done():
+    async def _ping_upstream() -> bool:
+        """Send a ping to the upstream server. Returns True if alive.
+        Uses existing cached client if available (zero session overhead),
+        falls back to a fresh probe client only during reconnection."""
+        # Try pinging via an existing cached client first (no new session needed)
+        for _session_key, cached_client in list(client._caches.items()):
+            try:
+                if cached_client.is_connected():
+                    await cached_client.ping()
+                    return True
+            except Exception:
+                return False
+
+        # No cached client — probe with a fresh connection (only during reconnection phase)
+        try:
+            test_client = client.new()
+            async with test_client:
+                await test_client.ping()
             return True
-        # Was connected (nesting_counter > 0) but session is None → died
-        if state.nesting_counter > 0 and state.session is None:
-            return True
-        return False
+        except Exception:
+            return False
 
     async def _health_monitor(task_status=anyio.TASK_STATUS_IGNORED):
-        """Background task that monitors upstream health, clears tools on disconnect,
-        and proactively reconnects when the upstream server comes back."""
+        """Background task that monitors upstream health via active pinging.
+        Clears tools on disconnect, re-notifies IDE on recovery."""
         task_status.started()
         was_disconnected = False
 
         while True:
             await anyio.sleep(_HEALTH_CHECK_INTERVAL)
 
-            # Check all cached upstream clients for dead sessions
-            dead_sessions = []
-            for session_key, upstream_client in list(client._caches.items()):
-                if _is_client_dead(upstream_client):
-                    dead_sessions.append(session_key)
+            alive = await _ping_upstream()
 
-            if dead_sessions:
-                if not was_disconnected:
-                    # First detection of disconnect — invalidate and notify
-                    logger.warning("Upstream connection lost — clearing tools and starting reconnection")
-                    was_disconnected = True
-                    await _invalidate_and_notify_disconnect()
-                    # Evict dead clients so next attempt creates fresh ones
-                    for session_key in dead_sessions:
-                        _evict_dead_client(client, session_key)
+            if not alive and not was_disconnected:
+                # Upstream just died — evict stale clients, invalidate, notify IDE
+                logger.warning("Upstream connection lost — clearing tools and starting reconnection")
+                was_disconnected = True
+                # Evict all cached clients so they don't block future reconnections
+                for session_key in list(client._caches.keys()):
+                    _evict_dead_client(client, session_key)
+                await _invalidate_and_notify_disconnect()
 
-                # Proactively try to reconnect
-                try:
-                    test_client = client.new()
-                    async with test_client:
-                        # If we get here, connection succeeded
-                        await test_client.ping()
-                    logger.info("Upstream server is back — reconnection successful")
-                    was_disconnected = False
-                    await _notify_reconnected()
-                except Exception as e:
-                    logger.debug("Reconnection probe failed: %s", e)
-
-            elif was_disconnected:
-                # No dead sessions in cache (they were evicted), but we were disconnected.
-                # Try to reconnect proactively.
-                try:
-                    test_client = client.new()
-                    async with test_client:
-                        await test_client.ping()
-                    logger.info("Upstream server is back — reconnection successful")
-                    was_disconnected = False
-                    await _notify_reconnected()
-                except Exception as e:
-                    logger.debug("Reconnection probe failed: %s", e)
+            elif alive and was_disconnected:
+                # Upstream just came back — notify IDE to refresh
+                logger.info("Upstream server is back — reconnection successful")
+                was_disconnected = False
+                await _notify_reconnected()
 
     logger.info("Proxy server ready — waiting for STDIO connections")
     logger.info("Platform: %s %s | Python: %s", sys.platform, os.uname().machine if hasattr(os, 'uname') else 'unknown', sys.version.split()[0])
