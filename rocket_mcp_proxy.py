@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-# Configure logging — writes to stderr so STDIO protocol on stdout is unaffected.
+# Configure logging — writes to stderr so STDIO protocol on stdout is unaffected..
 # Set ROCKET_LOG_LEVEL=DEBUG for verbose output (default: INFO).
 _log_level = os.environ.get("ROCKET_LOG_LEVEL", "DEBUG").upper()
 logging.basicConfig(
