@@ -11,8 +11,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 # Configure logging — writes to stderr so STDIO protocol on stdout is unaffected.
-# Set MCP_PROXY_LOG_LEVEL=DEBUG for verbose output (default: INFO).
-_log_level = os.environ.get("MCP_PROXY_LOG_LEVEL", "DEBUG").upper()
+# Set ROCKET_LOG_LEVEL=DEBUG for verbose output (default: INFO).
+_log_level = os.environ.get("ROCKET_LOG_LEVEL", "DEBUG").upper()
 logging.basicConfig(
     level=getattr(logging, _log_level, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -213,10 +213,7 @@ def normalize_server_config(server_config: Any, config_path: Path, context: str 
                 f"Config 'auth' must be a string or an object{suffix}: {config_path}"
             )
 
-    # Optional display name for the proxy (shown in IDE)
-    name = server_config.get("name")
-
-    return {"url": url.strip(), "headers": headers, "type": transport_type, "auth": auth, "name": name}
+    return {"url": url.strip(), "headers": headers, "type": transport_type, "auth": auth}
 
 
 def load_config(config_path: Path, server_name: str | None = None) -> dict[str, Any]:
@@ -257,11 +254,7 @@ def load_config(config_path: Path, server_name: str | None = None) -> dict[str, 
                 f"Server '{selected_server}' not found in config. Available: {available}: {config_path}"
             )
 
-        result = normalize_server_config(server_config, config_path, context=f"server={selected_server}")
-        # Use server slot name as fallback display name
-        if result["name"] is None:
-            result["name"] = selected_server
-        return result
+        return normalize_server_config(server_config, config_path, context=f"server={selected_server}")
 
     if server_name:
         raise ValueError(
@@ -272,19 +265,18 @@ def load_config(config_path: Path, server_name: str | None = None) -> dict[str, 
     return normalize_server_config(config, config_path)
 
 
-def resolve_proxy_settings(args: argparse.Namespace) -> tuple[str, dict[str, str], str, Any, str]:
+def resolve_proxy_settings(args: argparse.Namespace) -> tuple[str, dict[str, str], str, Any]:
     if args.url:
         logger.info("Using CLI URL: %s", args.url)
-        return args.url, parse_headers(args.headers), (args.type or "http"), None, "MCP Proxy"
+        return args.url, parse_headers(args.headers), (args.type or "http"), None
 
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
     config = load_config(config_path, server_name=args.server)
     transport_type = args.type if args.type else config["type"]
-    proxy_name = config.get("name") or "MCP Proxy"
-    logger.debug("Resolved config — url=%s type=%s headers=%d auth=%s name=%s",
+    logger.debug("Resolved config — url=%s type=%s headers=%d auth=%s",
                  config["url"], transport_type, len(config["headers"]),
-                 "present" if config.get("auth") else "none", proxy_name)
-    return config["url"], config["headers"], transport_type, config.get("auth"), proxy_name
+                 "present" if config.get("auth") else "none")
+    return config["url"], config["headers"], transport_type, config.get("auth")
 
 
 def main():
@@ -316,7 +308,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        url, headers, transport_type, auth_config, proxy_name = resolve_proxy_settings(args)
+        url, headers, transport_type, auth_config = resolve_proxy_settings(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -525,7 +517,7 @@ def main():
     # HTTP connection → same Mcp-Session-Id → server sees a persistent session.
     logger.debug("Creating StatefulProxyClient with session caching")
     client = StatefulProxyClient(transport=transport, message_handler=notification_handler)
-    proxy = FastMCPProxy(client_factory=client.new_stateful, name=proxy_name)
+    proxy = FastMCPProxy(client_factory=client.new_stateful, name="MCP Proxy")
     # Wire the proxy reference so the notification handler can forward to downstream sessions
     notification_handler.set_proxy(proxy)
 
@@ -598,218 +590,48 @@ def main():
     # server doesn't know the request was cancelled — it keeps working.
     # We wrap ProxyTool.run() to catch the cancellation and forward it upstream.
     import anyio
-    import httpx
     from fastmcp.server.providers.proxy import ProxyTool
-    from mcp import ServerSession
 
     _original_proxy_tool_run = ProxyTool.run
 
-    # ---------------------------------------------------------------------------
-    # Fix #7: Reconnection resilience when upstream server restarts
-    # ---------------------------------------------------------------------------
-    # If a tool call hits a dead connection (race with the health monitor),
-    # evict the stale client and retry once with a fresh connection.
-    _RECONNECT_RETRIES = 2  # just enough to handle the race condition
-
-    def _is_connection_error(exc: BaseException) -> bool:
-        """Return True if the exception indicates a dead/broken upstream connection."""
-        if isinstance(exc, (
-            httpx.ConnectError,
-            httpx.RemoteProtocolError,
-            httpx.ReadError,
-            httpx.WriteError,
-            httpx.ConnectTimeout,
-            httpx.ReadTimeout,
-            anyio.ClosedResourceError,
-            anyio.BrokenResourceError,
-            ConnectionError,
-            OSError,
-        )):
-            return True
-        # RuntimeError messages from the fastmcp client
-        msg = str(exc).lower()
-        if isinstance(exc, RuntimeError) and any(phrase in msg for phrase in (
-            "client failed to connect",
-            "session was closed unexpectedly",
-            "session task completed without exception",
-        )):
-            return True
-        return False
-
-    def _evict_dead_client(stateful_client: StatefulProxyClient, session: ServerSession) -> None:
-        """Remove the dead cached client for this session so next call creates a fresh one."""
-        dead = stateful_client._caches.pop(session, None)
-        if dead is not None:
-            logger.info("Evicted dead upstream client from cache for session %s", session)
-
-    async def _resilient_run(self, arguments, context=None):
-        """Wraps ProxyTool.run with cancellation forwarding and reconnection retry."""
-        last_exc: BaseException | None = None
-
-        for attempt in range(_RECONNECT_RETRIES):
-            try:
-                return await _original_proxy_tool_run(self, arguments, context)
-            except BaseException as exc:
-                # Cancellation: forward upstream and re-raise immediately (no retry)
-                if isinstance(exc, anyio.get_cancelled_exc_class()):
-                    logger.info("Tool call cancelled by IDE — forwarding cancellation upstream")
-                    try:
-                        upstream_client = await self._get_client()
-                        if upstream_client.is_connected() and hasattr(upstream_client, 'session'):
-                            await upstream_client._disconnect(force=True)
-                            logger.debug("Upstream client disconnected to signal cancellation")
-                    except Exception as cancel_err:
-                        logger.warning("Failed to forward cancellation upstream: %s", cancel_err)
-                    raise
-
-                # Connection errors: evict dead client and retry
-                if _is_connection_error(exc):
-                    last_exc = exc
-                    logger.warning(
-                        "Upstream connection error (attempt %d/%d): %s — evicting stale client",
-                        attempt + 1, _RECONNECT_RETRIES, exc,
-                    )
-                    # Evict the dead client so new_stateful() creates a fresh one
-                    try:
-                        from fastmcp.server.dependencies import get_context
-                        ctx = get_context()
-                        session = ctx.session
-                        _evict_dead_client(client, session)
-                    except Exception as evict_err:
-                        logger.debug("Could not evict cached client: %s", evict_err)
-                    await anyio.sleep(1.0)
-                    continue
-
-                # Non-connection errors: propagate immediately
-                raise
-
-        # Retries exhausted — server is down, health monitor will handle recovery
-        logger.warning("Upstream server unreachable — health monitor will retry in background")
-        raise last_exc  # type: ignore[misc]
-
-    ProxyTool.run = _resilient_run
-
-    # ---------------------------------------------------------------------------
-    # Fix #8: Background health monitor — detect upstream death, clear tools,
-    # and proactively reconnect so the proxy survives server restarts.
-    # ---------------------------------------------------------------------------
-    _HEALTH_CHECK_INTERVAL = float(os.environ.get("MCP_PROXY_HEALTH_CHECK_INTERVAL", "3.0"))
-
-    async def _invalidate_and_notify_disconnect():
-        """Clear all caches and tell the IDE that tools/resources/prompts are gone."""
-        provider = notification_handler._get_provider()
-        if provider is not None:
-            provider._tools_cache = None
-            provider._resources_cache = None
-            provider._templates_cache = None
-            provider._prompts_cache = None
-        # Notify downstream IDE sessions so the tool list refreshes (shows empty)
-        for session in notification_handler._get_downstream_sessions():
-            try:
-                await session.send_tool_list_changed()
-            except Exception:
-                pass
-            try:
-                await session.send_resource_list_changed()
-            except Exception:
-                pass
-            try:
-                await session.send_prompt_list_changed()
-            except Exception:
-                pass
-        logger.info("Caches invalidated and IDE notified — tools/resources cleared")
-
-    async def _notify_reconnected():
-        """Tell the IDE to re-fetch tools/resources/prompts after reconnection."""
-        # Invalidate caches so the next list request fetches fresh from upstream
-        provider = notification_handler._get_provider()
-        if provider is not None:
-            provider._tools_cache = None
-            provider._resources_cache = None
-            provider._templates_cache = None
-            provider._prompts_cache = None
-        for session in notification_handler._get_downstream_sessions():
-            try:
-                await session.send_tool_list_changed()
-            except Exception:
-                pass
-            try:
-                await session.send_resource_list_changed()
-            except Exception:
-                pass
-            try:
-                await session.send_prompt_list_changed()
-            except Exception:
-                pass
-        logger.info("Reconnected — IDE notified to refresh tools/resources/prompts")
-
-    async def _ping_upstream() -> bool:
-        """Send a ping to the upstream server. Returns True if alive.
-        Uses existing cached client if available (zero session overhead),
-        falls back to a fresh probe client only during reconnection."""
-        # Try pinging via an existing cached client first (no new session needed)
-        for _session_key, cached_client in list(client._caches.items()):
-            try:
-                if cached_client.is_connected():
-                    await cached_client.ping()
-                    return True
-            except Exception:
-                return False
-
-        # No cached client — probe with a fresh connection (only during reconnection phase)
+    async def _cancellation_aware_run(self, arguments, context=None):
+        """Wraps ProxyTool.run to forward cancellation to the upstream server."""
         try:
-            test_client = client.new()
-            async with test_client:
-                await test_client.ping()
-            return True
-        except Exception:
-            return False
+            return await _original_proxy_tool_run(self, arguments, context)
+        except BaseException as exc:
+            if isinstance(exc, anyio.get_cancelled_exc_class()):
+                # Task was cancelled (IDE sent notifications/cancelled)
+                # Try to forward cancellation to upstream server
+                logger.info("Tool call cancelled by IDE — forwarding cancellation upstream")
+                try:
+                    upstream_client = await self._get_client()
+                    if upstream_client.is_connected() and hasattr(upstream_client, 'session'):
+                        # The upstream request_id isn't easily accessible here,
+                        # but closing/disconnecting the client session signals the server
+                        await upstream_client._disconnect(force=True)
+                        logger.debug("Upstream client disconnected to signal cancellation")
+                except Exception as cancel_err:
+                    logger.warning("Failed to forward cancellation upstream: %s", cancel_err)
+            raise
 
-    async def _health_monitor(task_status=anyio.TASK_STATUS_IGNORED):
-        """Background task that monitors upstream health via active pinging.
-        Clears tools on disconnect, re-notifies IDE on recovery."""
-        task_status.started()
-        was_disconnected = False
-
-        while True:
-            await anyio.sleep(_HEALTH_CHECK_INTERVAL)
-
-            alive = await _ping_upstream()
-
-            if not alive and not was_disconnected:
-                # Upstream just died — evict stale clients, invalidate, notify IDE
-                logger.warning("Upstream connection lost — clearing tools and starting reconnection")
-                was_disconnected = True
-                # Evict all cached clients so they don't block future reconnections
-                for session_key in list(client._caches.keys()):
-                    _evict_dead_client(client, session_key)
-                await _invalidate_and_notify_disconnect()
-
-            elif alive and was_disconnected:
-                # Upstream just came back — notify IDE to refresh
-                logger.info("Upstream server is back — reconnection successful")
-                was_disconnected = False
-                await _notify_reconnected()
+    ProxyTool.run = _cancellation_aware_run
 
     logger.info("Proxy server ready — waiting for STDIO connections")
     logger.info("Platform: %s %s | Python: %s", sys.platform, os.uname().machine if hasattr(os, 'uname') else 'unknown', sys.version.split()[0])
     try:
         async def _run_with_full_capabilities():
-            async with anyio.create_task_group() as tg:
-                await tg.start(_health_monitor)
-                async with stdio_server() as (read_stream, write_stream):
-                    await proxy._mcp_server.run(
-                        read_stream,
-                        write_stream,
-                        proxy._mcp_server.create_initialization_options(
-                            notification_options=NotificationOptions(
-                                tools_changed=True,
-                                resources_changed=True,
-                                prompts_changed=True,
-                            ),
+            async with stdio_server() as (read_stream, write_stream):
+                await proxy._mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    proxy._mcp_server.create_initialization_options(
+                        notification_options=NotificationOptions(
+                            tools_changed=True,
+                            resources_changed=True,
+                            prompts_changed=True,
                         ),
-                    )
-                tg.cancel_scope.cancel()
+                    ),
+                )
 
         anyio.run(_run_with_full_capabilities)
     except KeyboardInterrupt:
