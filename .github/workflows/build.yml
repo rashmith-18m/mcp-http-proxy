@@ -63,9 +63,9 @@ jobs:
         if: matrix.python-arch == 'x64' && runner.os == 'macOS'
         run: |
           arch -x86_64 python3 -m pip install --upgrade pip
-          arch -x86_64 python3 -m pip install --no-cache-dir pyinstaller fastmcp
+          arch -x86_64 python3 -m pip install --no-cache-dir --only-binary :all: pyinstaller fastmcp
         env:
-          _PYTHON_HOST_PLATFORM: "macosx-10.9-x86_64"
+          _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
 
       - name: Build binary
         if: "!(matrix.python-arch == 'x64' && runner.os == 'macOS')"
@@ -75,7 +75,7 @@ jobs:
         if: matrix.python-arch == 'x64' && runner.os == 'macOS'
         run: arch -x86_64 python3 build_proxy.py
         env:
-          _PYTHON_HOST_PLATFORM: "macosx-10.9-x86_64"
+          _PYTHON_HOST_PLATFORM: "macosx-11.0-x86_64"
 
       - name: Verify binary architecture (macOS)
         if: runner.os == 'macOS'
