@@ -213,7 +213,10 @@ def normalize_server_config(server_config: Any, config_path: Path, context: str 
                 f"Config 'auth' must be a string or an object{suffix}: {config_path}"
             )
 
-    return {"url": url.strip(), "headers": headers, "type": transport_type, "auth": auth}
+    # Optional display name for the proxy (shown in IDE)
+    name = server_config.get("name")
+
+    return {"url": url.strip(), "headers": headers, "type": transport_type, "auth": auth, "name": name}
 
 
 def load_config(config_path: Path, server_name: str | None = None) -> dict[str, Any]:
@@ -254,7 +257,11 @@ def load_config(config_path: Path, server_name: str | None = None) -> dict[str, 
                 f"Server '{selected_server}' not found in config. Available: {available}: {config_path}"
             )
 
-        return normalize_server_config(server_config, config_path, context=f"server={selected_server}")
+        result = normalize_server_config(server_config, config_path, context=f"server={selected_server}")
+        # Use server slot name as fallback display name
+        if result["name"] is None:
+            result["name"] = selected_server
+        return result
 
     if server_name:
         raise ValueError(
@@ -265,18 +272,19 @@ def load_config(config_path: Path, server_name: str | None = None) -> dict[str, 
     return normalize_server_config(config, config_path)
 
 
-def resolve_proxy_settings(args: argparse.Namespace) -> tuple[str, dict[str, str], str, Any]:
+def resolve_proxy_settings(args: argparse.Namespace) -> tuple[str, dict[str, str], str, Any, str]:
     if args.url:
         logger.info("Using CLI URL: %s", args.url)
-        return args.url, parse_headers(args.headers), (args.type or "http"), None
+        return args.url, parse_headers(args.headers), (args.type or "http"), None, "MCP Proxy"
 
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
     config = load_config(config_path, server_name=args.server)
     transport_type = args.type if args.type else config["type"]
-    logger.debug("Resolved config — url=%s type=%s headers=%d auth=%s",
+    proxy_name = config.get("name") or "MCP Proxy"
+    logger.debug("Resolved config — url=%s type=%s headers=%d auth=%s name=%s",
                  config["url"], transport_type, len(config["headers"]),
-                 "present" if config.get("auth") else "none")
-    return config["url"], config["headers"], transport_type, config.get("auth")
+                 "present" if config.get("auth") else "none", proxy_name)
+    return config["url"], config["headers"], transport_type, config.get("auth"), proxy_name
 
 
 def main():
@@ -308,7 +316,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        url, headers, transport_type, auth_config = resolve_proxy_settings(args)
+        url, headers, transport_type, auth_config, proxy_name = resolve_proxy_settings(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -517,7 +525,7 @@ def main():
     # HTTP connection → same Mcp-Session-Id → server sees a persistent session.
     logger.debug("Creating StatefulProxyClient with session caching")
     client = StatefulProxyClient(transport=transport, message_handler=notification_handler)
-    proxy = FastMCPProxy(client_factory=client.new_stateful, name="MCP Proxy")
+    proxy = FastMCPProxy(client_factory=client.new_stateful, name=proxy_name)
     # Wire the proxy reference so the notification handler can forward to downstream sessions
     notification_handler.set_proxy(proxy)
 
