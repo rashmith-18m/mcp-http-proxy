@@ -101,6 +101,18 @@ ALLOWED_HOST_SUFFIXES = [
     ".verticacorp.com"
 ]
 
+# Default allowed commands for stdio transport (binaries that can be spawned).
+# No restriction — network filtering is the security control.
+
+
+def _is_host_allowed(hostname: str) -> bool:
+    """Check if a hostname matches ALLOWED_HOST_SUFFIXES (same logic as is_url_allowed)."""
+    hostname = hostname.lower()
+    return any(
+        hostname == suffix.lstrip(".") or hostname.endswith(suffix)
+        for suffix in ALLOWED_HOST_SUFFIXES
+    )
+
 
 def is_url_allowed(url: str) -> bool:
     """Check if the URL's host matches the allowlist."""
@@ -154,11 +166,253 @@ def default_config_path() -> Path:
     return fallback
 
 
+def _start_filtering_proxy() -> int:
+    """Start a local HTTP/HTTPS filtering proxy that enforces ALLOWED_HOST_SUFFIXES.
+
+    Returns the port the proxy is listening on. The proxy runs in a daemon thread
+    and terminates when the main process exits.
+    """
+    import socket
+    import selectors
+    import threading
+
+    def _handle_connect(client_sock: socket.socket, host: str, port: int):
+        """Handle HTTPS CONNECT tunneling."""
+        if not _is_host_allowed(host):
+            response = (
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Connection: close\r\n\r\n"
+                b"Blocked by MCP proxy: host not in allowlist\n"
+            )
+            client_sock.sendall(response)
+            client_sock.close()
+            logger.warning("Filtering proxy: BLOCKED CONNECT to %s:%d", host, port)
+            return
+
+        # Connect to the target
+        try:
+            remote_sock = socket.create_connection((host, port), timeout=30)
+        except Exception as e:
+            response = f"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n{e}\n".encode()
+            client_sock.sendall(response)
+            client_sock.close()
+            return
+
+        # Send 200 to client — tunnel established
+        client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        logger.debug("Filtering proxy: ALLOWED CONNECT to %s:%d", host, port)
+
+        # Bidirectional relay
+        _relay(client_sock, remote_sock)
+
+    def _handle_http(client_sock: socket.socket, method: str, url: str, headers_raw: bytes):
+        """Handle plain HTTP requests (non-CONNECT)."""
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port or 80
+
+        if not _is_host_allowed(host):
+            response = (
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Connection: close\r\n\r\n"
+                b"Blocked by MCP proxy: host not in allowlist\n"
+            )
+            client_sock.sendall(response)
+            client_sock.close()
+            logger.warning("Filtering proxy: BLOCKED %s to %s:%d", method, host, port)
+            return
+
+        # Forward to target
+        try:
+            remote_sock = socket.create_connection((host, port), timeout=30)
+        except Exception as e:
+            response = f"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n{e}\n".encode()
+            client_sock.sendall(response)
+            client_sock.close()
+            return
+
+        # Rewrite absolute URL to relative path for the upstream server
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        request_line = f"{method} {path} HTTP/1.1\r\n".encode()
+        remote_sock.sendall(request_line + headers_raw)
+        logger.debug("Filtering proxy: ALLOWED %s to %s:%d", method, host, port)
+
+        # Bidirectional relay
+        _relay(client_sock, remote_sock)
+
+    def _relay(sock_a: socket.socket, sock_b: socket.socket):
+        """Relay data between two sockets until one closes."""
+        sel = selectors.DefaultSelector()
+        sock_a.setblocking(False)
+        sock_b.setblocking(False)
+        sel.register(sock_a, selectors.EVENT_READ)
+        sel.register(sock_b, selectors.EVENT_READ)
+        try:
+            while True:
+                events = sel.select(timeout=60)
+                if not events:
+                    break
+                for key, _ in events:
+                    source = key.fileobj
+                    dest = sock_b if source is sock_a else sock_a
+                    try:
+                        data = source.recv(65536)
+                    except (OSError, ConnectionError):
+                        data = b""
+                    if not data:
+                        return
+                    try:
+                        dest.sendall(data)
+                    except (OSError, ConnectionError):
+                        return
+        finally:
+            sel.close()
+            sock_a.close()
+            sock_b.close()
+
+    def _proxy_thread(server_sock: socket.socket):
+        """Accept connections and dispatch handlers."""
+        server_sock.settimeout(1.0)
+        while True:
+            try:
+                client_sock, _ = server_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=_handle_client, args=(client_sock,), daemon=True).start()
+
+    def _handle_client(client_sock: socket.socket):
+        """Parse the first line of the HTTP request and dispatch."""
+        try:
+            client_sock.settimeout(30)
+            # Read until we get the full headers
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = client_sock.recv(4096)
+                if not chunk:
+                    client_sock.close()
+                    return
+                buf += chunk
+
+            header_end = buf.index(b"\r\n\r\n") + 4
+            header_block = buf[:header_end]
+            first_line, _, rest_headers = header_block.partition(b"\r\n")
+            parts = first_line.decode("utf-8", errors="replace").split(" ", 2)
+            if len(parts) < 2:
+                client_sock.close()
+                return
+
+            method = parts[0].upper()
+            target = parts[1]
+
+            if method == "CONNECT":
+                # target is host:port
+                if ":" in target:
+                    host, port_str = target.rsplit(":", 1)
+                    port = int(port_str)
+                else:
+                    host, port = target, 443
+                _handle_connect(client_sock, host, port)
+            else:
+                # Plain HTTP — target is absolute URL
+                _handle_http(client_sock, method, target, rest_headers)
+        except Exception:
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+
+    # Bind to a random available port on localhost
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(32)
+    port = server_sock.getsockname()[1]
+
+    # Start proxy in daemon thread
+    t = threading.Thread(target=_proxy_thread, args=(server_sock,), daemon=True)
+    t.start()
+    logger.info("Filtering proxy started on 127.0.0.1:%d — enforcing ALLOWED_HOST_SUFFIXES for stdio child", port)
+    return port
+
+
+def _build_sandboxed_env(proxy_port: int, user_env: dict[str, str] | None) -> dict[str, str]:
+    """Build environment dict for the child process with network egress filtered via local proxy."""
+    env = dict(os.environ)
+    if user_env:
+        env.update(user_env)
+
+    # Point all HTTP traffic through our filtering proxy
+    proxy_url = f"http://127.0.0.1:{proxy_port}"
+    env["HTTP_PROXY"] = proxy_url
+    env["HTTPS_PROXY"] = proxy_url
+    env["http_proxy"] = proxy_url
+    env["https_proxy"] = proxy_url
+    # Remove any bypass vars that would let traffic escape the proxy
+    env["NO_PROXY"] = ""
+    env["no_proxy"] = ""
+    env.pop("ALL_PROXY", None)
+    env.pop("all_proxy", None)
+
+    return env
+
+
 def normalize_server_config(server_config: Any, config_path: Path, context: str = "") -> dict[str, Any]:
     if not isinstance(server_config, dict):
         suffix = f" ({context})" if context else ""
         raise ValueError(f"Config server entry must be a JSON object{suffix}: {config_path}")
 
+    # Transport type: "http"/"streamable-http" (default), "sse", or "stdio"
+    transport_type = server_config.get("type") or "http"
+    if transport_type == "streamable-http":
+        transport_type = "http"
+    if transport_type not in ("http", "sse", "stdio"):
+        suffix = f" ({context})" if context else ""
+        raise ValueError(
+            f"Config 'type' must be 'http', 'streamable-http', 'sse', or 'stdio'{suffix}: {config_path}"
+        )
+
+    # Optional display name for the proxy (shown in IDE)
+    name = server_config.get("name")
+
+    # --- STDIO transport: command-based ---
+    if transport_type == "stdio":
+        command = server_config.get("command")
+        if not isinstance(command, str) or not command.strip():
+            suffix = f" ({context})" if context else ""
+            raise ValueError(
+                f"Config 'command' must be a non-empty string for stdio transport{suffix}: {config_path}"
+            )
+        args = server_config.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            suffix = f" ({context})" if context else ""
+            raise ValueError(
+                f"Config 'args' must be a list of strings{suffix}: {config_path}"
+            )
+        child_env = server_config.get("env")
+        if child_env is not None and not isinstance(child_env, dict):
+            suffix = f" ({context})" if context else ""
+            raise ValueError(f"Config 'env' must be an object{suffix}: {config_path}")
+        cwd = server_config.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            suffix = f" ({context})" if context else ""
+            raise ValueError(f"Config 'cwd' must be a string{suffix}: {config_path}")
+
+        return {
+            "type": "stdio",
+            "command": command.strip(),
+            "args": args,
+            "env": child_env,
+            "cwd": cwd,
+            "name": name,
+        }
+
+    # --- HTTP/SSE transport: URL-based ---
     url = server_config.get("url")
     if not isinstance(url, str) or not url.strip():
         suffix = f" ({context})" if context else ""
@@ -185,39 +439,26 @@ def normalize_server_config(server_config: Any, config_path: Path, context: str 
             f"Config file 'headers' must be an object or a list of key=value strings{suffix}: {config_path}"
         )
 
-    # Transport type: "http" (streamable HTTP, default) or "sse"
-    transport_type = server_config.get("type") or "http"
-    if transport_type not in ("http", "sse"):
-        suffix = f" ({context})" if context else ""
-        raise ValueError(
-            f"Config 'type' must be 'http' or 'sse'{suffix}: {config_path}"
-        )
-
-    # Auth: "oauth" (auto), {"type": "oauth", "clientId": "...", ...}, or a bearer token string
-    auth_config = server_config.get("auth")
-    auth: dict[str, Any] | str | None = None
-    if auth_config is not None:
-        if isinstance(auth_config, str):
-            # "oauth" or a bearer token string
-            auth = auth_config
-        elif isinstance(auth_config, dict):
-            auth_type = auth_config.get("type", "").lower()
-            if auth_type != "oauth":
-                suffix = f" ({context})" if context else ""
-                raise ValueError(
-                    f"Config 'auth.type' must be 'oauth' when auth is an object{suffix}: {config_path}"
-                )
-            auth = auth_config
+    # OAuth config: check "oauth" (standard) with "auth" fallback (backward compat)
+    # Standard mcp.json uses "oauth": {"clientId": "..."} or just "oauth": "oauth" for auto-discovery
+    # Legacy format: "auth": "oauth" | "auth": {"type": "oauth", ...} | "auth": "<bearer-token>"
+    oauth_config = server_config.get("oauth") or server_config.get("auth")
+    oauth: dict[str, Any] | str | None = None
+    if oauth_config is not None:
+        if isinstance(oauth_config, str):
+            # "oauth" (auto-discovery) or a bearer token string
+            oauth = oauth_config
+        elif isinstance(oauth_config, dict):
+            # Standard: {"clientId": "..."} or legacy: {"type": "oauth", "clientId": "..."}
+            # Accept both — just ignore "type" field if present
+            oauth = oauth_config
         else:
             suffix = f" ({context})" if context else ""
             raise ValueError(
-                f"Config 'auth' must be a string or an object{suffix}: {config_path}"
+                f"Config 'oauth' must be a string or an object{suffix}: {config_path}"
             )
 
-    # Optional display name for the proxy (shown in IDE)
-    name = server_config.get("name")
-
-    return {"url": url.strip(), "headers": headers, "type": transport_type, "auth": auth, "name": name}
+    return {"url": url.strip(), "headers": headers, "type": transport_type, "oauth": oauth, "name": name}
 
 
 def load_config(config_path: Path, server_name: str | None = None) -> dict[str, Any]:
@@ -272,19 +513,40 @@ def load_config(config_path: Path, server_name: str | None = None) -> dict[str, 
     return normalize_server_config(config, config_path)
 
 
-def resolve_proxy_settings(args: argparse.Namespace) -> tuple[str, dict[str, str], str, Any, str]:
+def resolve_proxy_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve all proxy settings from CLI args and config file. Returns a unified config dict."""
     if args.url:
         logger.info("Using CLI URL: %s", args.url)
-        return args.url, parse_headers(args.headers), (args.type or "http"), None, "MCP Proxy"
+        transport_type = args.type or "http"
+        if transport_type == "streamable-http":
+            transport_type = "http"
+        return {
+            "type": transport_type,
+            "url": args.url,
+            "headers": parse_headers(args.headers),
+            "oauth": None,
+            "name": "MCP Proxy",
+        }
 
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
     config = load_config(config_path, server_name=args.server)
-    transport_type = args.type if args.type else config["type"]
-    proxy_name = config.get("name") or "MCP Proxy"
-    logger.debug("Resolved config — url=%s type=%s headers=%d auth=%s name=%s",
-                 config["url"], transport_type, len(config["headers"]),
-                 "present" if config.get("auth") else "none", proxy_name)
-    return config["url"], config["headers"], transport_type, config.get("auth"), proxy_name
+    # CLI --type overrides config
+    if args.type:
+        config["type"] = args.type
+        if config["type"] == "streamable-http":
+            config["type"] = "http"
+    if not config.get("name"):
+        config["name"] = "MCP Proxy"
+
+    # For stdio, log the command being used
+    if config["type"] == "stdio":
+        logger.debug("Resolved config — type=stdio command=%s args=%s name=%s",
+                     config["command"], config.get("args"), config["name"])
+    else:
+        logger.debug("Resolved config — url=%s type=%s headers=%d oauth=%s name=%s",
+                     config["url"], config["type"], len(config.get("headers", {})),
+                     "present" if config.get("oauth") else "none", config["name"])
+    return config
 
 
 def main():
@@ -309,32 +571,45 @@ def main():
     )
     parser.add_argument(
         "--type",
-        choices=["http", "sse"],
+        choices=["http", "streamable-http", "sse", "stdio"],
         default=None,
-        help="Transport type: 'http' (streamable HTTP, default) or 'sse'. Overrides config file.",
+        help="Transport type: 'http'/'streamable-http' (streamable HTTP, default), 'sse', or 'stdio'. Overrides config file.",
     )
     args = parser.parse_args()
 
     try:
-        url, headers, transport_type, auth_config, proxy_name = resolve_proxy_settings(args)
+        settings = resolve_proxy_settings(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    logger.info("Proxy starting — url=%s transport=%s auth=%s", url, transport_type,
-                "oauth" if auth_config == "oauth" else type(auth_config).__name__ if auth_config else "none")
+    transport_type = settings["type"]
+    proxy_name = settings["name"]
 
-    if not is_url_allowed(url):
-        logger.error("URL not in allowlist: %s", url)
-        print(
-            f"ERROR: URL '{url}' is not allowed. "
-            f"Only localhost and *.rocketsoftware.com endpoints are permitted. "
-            f"If you need access to an external MCP server, raise an RAC with the AI.CoE team.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    if transport_type == "stdio":
+        # STDIO transport — spawn a sandboxed child process
+        logger.info("Proxy starting — type=stdio command=%s",
+                    settings["command"])
+    else:
+        # HTTP/SSE transport — connect to a remote URL
+        url = settings["url"]
+        headers = settings.get("headers", {})
+        auth_config = settings.get("oauth")
 
-    logger.debug("URL allowlist check passed for: %s", url)
+        logger.info("Proxy starting — url=%s transport=%s auth=%s", url, transport_type,
+                    "oauth" if auth_config == "oauth" else type(auth_config).__name__ if auth_config else "none")
+
+        if not is_url_allowed(url):
+            logger.error("URL not in allowlist: %s", url)
+            print(
+                f"ERROR: URL '{url}' is not allowed. "
+                f"Only localhost and *.rocketsoftware.com endpoints are permitted. "
+                f"If you need access to an external MCP server, raise an RAC with the AI.CoE team.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        logger.debug("URL allowlist check passed for: %s", url)
 
     # Ensure localhost traffic bypasses any corporate proxy.
     # Merge with existing NO_PROXY so external proxy settings are preserved.
@@ -348,10 +623,12 @@ def main():
 
     # Import here (deferred) to avoid bytecode analysis issues with dependencies
     import mcp.types
-    from fastmcp.client.auth.oauth import OAuth
     from fastmcp.client.messages import MessageHandler
-    from fastmcp.client.transports import SSETransport, StreamableHttpTransport
     from fastmcp.server.providers.proxy import FastMCPProxy, ProxyProvider, StatefulProxyClient
+
+    if transport_type != "stdio":
+        from fastmcp.client.auth.oauth import OAuth
+        from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 
     # Enable debug logging for OAuth/auth flow internals
     logging.getLogger("fastmcp.client.auth").setLevel(logging.DEBUG)
@@ -480,45 +757,72 @@ def main():
 
     notification_handler = NotificationForwardingHandler()
 
-    # Resolve auth parameter for transport
-    auth = None
-    if auth_config == "oauth":
-        logger.info("OAuth mode: automatic discovery (no pre-configured client credentials)")
-        auth = "oauth"
-    elif isinstance(auth_config, dict):
-        # OAuth with explicit client credentials
-        oauth_kwargs: dict[str, Any] = {}
-        if auth_config.get("clientId"):
-            oauth_kwargs["client_id"] = auth_config["clientId"]
-        if auth_config.get("clientSecret"):
-            oauth_kwargs["client_secret"] = auth_config["clientSecret"]
-        if auth_config.get("scopes"):
-            oauth_kwargs["scopes"] = auth_config["scopes"]
-        if auth_config.get("callbackPort"):
-            oauth_kwargs["callback_port"] = int(auth_config["callbackPort"])
-        logger.info("OAuth mode: explicit credentials — client_id=%s scopes=%s",
-                    oauth_kwargs.get("client_id", "<none>"), oauth_kwargs.get("scopes", "<none>"))
-        auth = OAuth(**oauth_kwargs)
-    elif isinstance(auth_config, str) and auth_config != "oauth":
-        # Bearer token string
-        logger.info("Auth mode: static bearer token")
-        auth = auth_config
-    else:
-        logger.info("Auth mode: none (no auth configured)")
+    # ---------------------------------------------------------------------------
+    # Transport creation — branching on type
+    # ---------------------------------------------------------------------------
+    if transport_type == "stdio":
+        # STDIO transport: spawn child process with network egress filtered
+        from fastmcp.client.transports import StdioTransport
 
-    logger.info("Creating %s transport to %s", transport_type.upper(), url)
-    if transport_type == "sse":
-        transport = SSETransport(url, headers=headers if headers else None, auth=auth)
-    else:
-        transport = StreamableHttpTransport(url, headers=headers if headers else None, auth=auth)
+        # Start local filtering proxy that enforces ALLOWED_HOST_SUFFIXES
+        proxy_port = _start_filtering_proxy()
+        child_env = _build_sandboxed_env(proxy_port, settings.get("env"))
+        command = settings["command"]
+        cmd_args = settings.get("args", [])
 
-    if hasattr(transport, 'auth') and transport.auth is not None:
-        auth_obj = transport.auth
-        logger.info("Transport auth object: %s", type(auth_obj).__name__)
-        if hasattr(auth_obj, 'mcp_url'):
-            logger.info("OAuth bound to MCP URL: %s", auth_obj.mcp_url)
-        if hasattr(auth_obj, 'redirect_port'):
-            logger.info("OAuth callback will listen on http://localhost:%d/callback", auth_obj.redirect_port)
+        logger.info("Creating STDIO transport — command=%s args=%s filtering_proxy=127.0.0.1:%d",
+                    command, cmd_args, proxy_port)
+        transport = StdioTransport(
+            command=command,
+            args=cmd_args,
+            env=child_env,
+            cwd=settings.get("cwd"),
+        )
+    else:
+        # HTTP/SSE transport: connect to a remote URL
+        auth_config = settings.get("oauth")
+        url = settings["url"]
+        headers = settings.get("headers", {})
+
+        # Resolve auth parameter for transport
+        auth = None
+        if auth_config == "oauth":
+            logger.info("OAuth mode: automatic discovery (no pre-configured client credentials)")
+            auth = "oauth"
+        elif isinstance(auth_config, dict):
+            # OAuth with explicit client credentials
+            oauth_kwargs: dict[str, Any] = {}
+            if auth_config.get("clientId"):
+                oauth_kwargs["client_id"] = auth_config["clientId"]
+            if auth_config.get("clientSecret"):
+                oauth_kwargs["client_secret"] = auth_config["clientSecret"]
+            if auth_config.get("scopes"):
+                oauth_kwargs["scopes"] = auth_config["scopes"]
+            if auth_config.get("callbackPort"):
+                oauth_kwargs["callback_port"] = int(auth_config["callbackPort"])
+            logger.info("OAuth mode: explicit credentials — client_id=%s scopes=%s",
+                        oauth_kwargs.get("client_id", "<none>"), oauth_kwargs.get("scopes", "<none>"))
+            auth = OAuth(**oauth_kwargs)
+        elif isinstance(auth_config, str) and auth_config != "oauth":
+            # Bearer token string
+            logger.info("Auth mode: static bearer token")
+            auth = auth_config
+        else:
+            logger.info("Auth mode: none (no auth configured)")
+
+        logger.info("Creating %s transport to %s", transport_type.upper(), url)
+        if transport_type == "sse":
+            transport = SSETransport(url, headers=headers if headers else None, auth=auth)
+        else:
+            transport = StreamableHttpTransport(url, headers=headers if headers else None, auth=auth)
+
+        if hasattr(transport, 'auth') and transport.auth is not None:
+            auth_obj = transport.auth
+            logger.info("Transport auth object: %s", type(auth_obj).__name__)
+            if hasattr(auth_obj, 'mcp_url'):
+                logger.info("OAuth bound to MCP URL: %s", auth_obj.mcp_url)
+            if hasattr(auth_obj, 'redirect_port'):
+                logger.info("OAuth callback will listen on http://localhost:%d/callback", auth_obj.redirect_port)
 
     # Use StatefulProxyClient to maintain session continuity:
     # all requests within the same downstream session reuse ONE upstream
