@@ -217,7 +217,7 @@ def _start_filtering_proxy() -> int:
         # Bidirectional relay
         _relay(client_sock, remote_sock)
 
-    def _handle_http(client_sock: socket.socket, method: str, url: str, headers_raw: bytes):
+    def _handle_http(client_sock: socket.socket, method: str, url: str, headers_raw: bytes, body_prefix: bytes = b""):
         """Handle plain HTTP requests (non-CONNECT)."""
         parsed = urlparse(url)
         host = parsed.hostname or ""
@@ -244,6 +244,8 @@ def _start_filtering_proxy() -> int:
             path += "?" + parsed.query
         request_line = f"{method} {path} HTTP/1.1\r\n".encode()
         remote_sock.sendall(request_line + headers_raw)
+        if body_prefix:
+            remote_sock.sendall(body_prefix)
         logger.debug("Filtering proxy: ALLOWED %s to %s:%d", method, host, port)
 
         # Bidirectional relay
@@ -315,6 +317,8 @@ def _start_filtering_proxy() -> int:
             method = parts[0].upper()
             target = parts[1]
 
+            body_prefix = buf[header_end:]  # body data already read beyond headers
+
             if method == "CONNECT":
                 # target is host:port
                 if ":" in target:
@@ -325,7 +329,7 @@ def _start_filtering_proxy() -> int:
                 _handle_connect(client_sock, host, port)
             else:
                 # Plain HTTP — target is absolute URL
-                _handle_http(client_sock, method, target, rest_headers)
+                _handle_http(client_sock, method, target, rest_headers, body_prefix)
         except Exception:
             try:
                 client_sock.close()
