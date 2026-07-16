@@ -176,18 +176,21 @@ def _start_filtering_proxy() -> int:
     import selectors
     import threading
 
-    def _blocked_response(host: str, port: int) -> bytes:
-        """Build a detailed error response matching the HTTP/SSE allowlist message."""
-        body = (
+    def _blocked_message(host: str, port: int) -> str:
+        """Build the detailed error message for blocked hosts."""
+        return (
             f"ERROR: Host '{host}:{port}' is not allowed. "
             f"Only localhost and *.rocketsoftware.com endpoints are permitted. "
             f"If you need access to an external MCP server, raise an RAC with the AI.CoE team."
         )
+
+    def _blocked_response(host: str, port: int) -> bytes:
+        """Build a detailed error response matching the HTTP/SSE allowlist message."""
         return (
             b"HTTP/1.1 403 Forbidden\r\n"
             b"Content-Type: text/plain\r\n"
             b"Connection: close\r\n\r\n"
-            + body.encode()
+            + _blocked_message(host, port).encode()
         )
 
     def _handle_connect(client_sock: socket.socket, host: str, port: int):
@@ -195,7 +198,7 @@ def _start_filtering_proxy() -> int:
         if not _is_host_allowed(host):
             client_sock.sendall(_blocked_response(host, port))
             client_sock.close()
-            logger.warning("Filtering proxy: BLOCKED CONNECT to %s:%d", host, port)
+            logger.error("Filtering proxy: %s", _blocked_message(host, port))
             return
 
         # Connect to the target
@@ -223,7 +226,7 @@ def _start_filtering_proxy() -> int:
         if not _is_host_allowed(host):
             client_sock.sendall(_blocked_response(host, port))
             client_sock.close()
-            logger.warning("Filtering proxy: BLOCKED %s to %s:%d", method, host, port)
+            logger.error("Filtering proxy: %s", _blocked_message(host, port))
             return
 
         # Forward to target
