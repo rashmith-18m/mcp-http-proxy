@@ -351,7 +351,12 @@ def _start_filtering_proxy() -> int:
 
 
 def _build_sandboxed_env(proxy_port: int, user_env: dict[str, str] | None) -> dict[str, str]:
-    """Build environment dict for the child process with network egress filtered via local proxy."""
+    """Build environment dict for the child process with network egress filtered via local proxy.
+
+    Allowed hosts (ALLOWED_HOST_SUFFIXES) bypass the proxy via NO_PROXY so their
+    HTTP traffic flows directly without the proxy needing to parse/forward request bodies.
+    Non-allowed hosts still route through the filtering proxy and get blocked.
+    """
     env = dict(os.environ)
     if user_env:
         env.update(user_env)
@@ -362,9 +367,19 @@ def _build_sandboxed_env(proxy_port: int, user_env: dict[str, str] | None) -> di
     env["HTTPS_PROXY"] = proxy_url
     env["http_proxy"] = proxy_url
     env["https_proxy"] = proxy_url
-    # Remove any bypass vars that would let traffic escape the proxy
-    env["NO_PROXY"] = ""
-    env["no_proxy"] = ""
+
+    # Allow trusted hosts to bypass the proxy (direct connection).
+    # The filtering proxy still blocks any non-allowed host that doesn't match NO_PROXY.
+    no_proxy_entries = {"localhost", "127.0.0.1", "::1"}
+    for suffix in ALLOWED_HOST_SUFFIXES:
+        # Convert ".rocketsoftware.com" to "*.rocketsoftware.com" for NO_PROXY
+        if suffix.startswith("."):
+            no_proxy_entries.add("*" + suffix)
+        else:
+            no_proxy_entries.add(suffix)
+    no_proxy_value = ",".join(sorted(no_proxy_entries))
+    env["NO_PROXY"] = no_proxy_value
+    env["no_proxy"] = no_proxy_value
     env.pop("ALL_PROXY", None)
     env.pop("all_proxy", None)
 
