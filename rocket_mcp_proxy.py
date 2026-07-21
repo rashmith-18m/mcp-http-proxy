@@ -372,11 +372,10 @@ def _build_sandboxed_env(proxy_port: int, user_env: dict[str, str] | None) -> di
     # The filtering proxy still blocks any non-allowed host that doesn't match NO_PROXY.
     no_proxy_entries = {"localhost", "127.0.0.1", "::1"}
     for suffix in ALLOWED_HOST_SUFFIXES:
-        # Convert ".rocketsoftware.com" to "*.rocketsoftware.com" for NO_PROXY
-        if suffix.startswith("."):
-            no_proxy_entries.add("*" + suffix)
-        else:
-            no_proxy_entries.add(suffix)
+        # Use bare suffix format (.rocketsoftware.com) — compatible with httpx, curl, and Node.js
+        no_proxy_entries.add(suffix.lstrip("*"))
+        # Also add without leading dot for exact domain match
+        no_proxy_entries.add(suffix.lstrip("*."))
     no_proxy_value = ",".join(sorted(no_proxy_entries))
     env["NO_PROXY"] = no_proxy_value
     env["no_proxy"] = no_proxy_value

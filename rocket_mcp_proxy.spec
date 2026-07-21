@@ -20,11 +20,11 @@ datas = copy_metadata('fastmcp') + copy_metadata('mcp')
 datas += get_rich_source_datas()
 
 a = Analysis(
-    ['/home/rtula/AI_Repos/research/mcp-http-proxy/rocket_mcp_proxy.py'],
+    ['C:/Work/AI_Repos/personal/rashmith-18m/mcp-http-proxy/rocket_mcp_proxy.py'],
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['mcp', 'mcp.types', 'mcp.shared', 'mcp.client', 'mcp.server'],
+    hiddenimports=['mcp', 'mcp.types', 'mcp.shared', 'mcp.client', 'mcp.server', 'mcp.client.sse', 'fastmcp.client.auth', 'fastmcp.client.auth.oauth', 'fastmcp.client.oauth_callback', 'fastmcp.server.providers.proxy'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
