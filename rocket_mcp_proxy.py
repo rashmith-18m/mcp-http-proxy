@@ -99,7 +99,8 @@ ALLOWED_HOST_SUFFIXES = [
     "::1",
     ".rocketsoftware.com",
     ".verticacorp.com",
-    "mcp.jointjs.com"
+    "mcp.jointjs.com",
+    ".figma.com"
 ]
 
 # Default allowed commands for stdio transport (binaries that can be spawned).
